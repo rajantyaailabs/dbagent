@@ -1,0 +1,22 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.0
+python-dotenv==1.0.1
+
+# Database
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.9
+
+# LangChain - latest stable versions
+langchain
+langchain-core
+langchain-community
+
+# LangGraph - latest stable
+langgraph
+
+# LLM Providers - latest compatible
+langchain-openai
+langchain-google-genai
+langchain-anthropic
