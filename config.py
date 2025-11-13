@@ -106,7 +106,7 @@ class AppConfig:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
     # Default LLM Settings
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "Gemini 2.5 Flash")
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gemini-2.5-flash")
     DEFAULT_TEMPERATURE: float = float(os.getenv("DEFAULT_TEMPERATURE", "0.0"))
 
     # Server Settings

@@ -1,3 +1,7 @@
+"""
+Workflow - LangGraph workflow for SQL agent with table-aware clarification
+"""
+
 import json
 import logging
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
@@ -10,6 +14,47 @@ from langgraph.prebuilt import ToolNode
 from llm_wrapper import LLMWrapper
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def normalize_content(content: Any) -> str:
+    """
+    Normalize message content from different LLM formats to a plain string.
+
+    Different LLMs return content in different formats:
+    - OpenAI: Returns plain string
+    - Gemini: Returns list of content blocks [{'type': 'text', 'text': '...'}]
+    - Anthropic: Can return either format
+
+    Args:
+        content: Content from LLM message (string, list, or other)
+
+    Returns:
+        Normalized string content
+    """
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if "text" in block:
+                    text_parts.append(str(block["text"]))
+                elif "content" in block:
+                    text_parts.append(str(block["content"]))
+                else:
+                    text_parts.append(str(block))
+            elif isinstance(block, str):
+                text_parts.append(block)
+            else:
+                text_parts.append(str(block))
+        return " ".join(text_parts).strip()
+
+    return str(content)
 
 
 # ============================================================================
@@ -54,289 +99,132 @@ def create_system_prompt(table_schemas: Dict[str, Any], available_tables: List[s
     
     tables_section = "\n".join(table_descriptions) if table_descriptions else "No tables specified"
     
-    return f"""You are a highly intelligent database assistant specialized in querying banking and financial data.
+    return f"""You are a highly intelligent database assistant specialized in querying banking and financial regulatory data.
 
 AVAILABLE TABLES FOR THIS REQUEST:
 {tables_section}
 
-AVAILABLE TOOLS:
-You have table-specific tools. Each tool is designed for a specific table and understands its schema deeply.
+AVAILABLE TOOLS FOR FFIEC TABLE:
+You have 3 powerful, flexible tools:
 
-Currently available: query_ffiec
+1. **query_ffiec_data** - Primary query tool with flexible filtering
+   Handles: Total assets, capital structure, balance sheet items, RWA, schedule comparisons, pattern matching
+   Use flexible filters: bank_identifier, reporting_date, report_elements, schedules, source_item_pattern
 
-**query_ffiec Tool:**
-Queries the FFIEC banking regulatory data table.
+2. **calculate_and_aggregate** - Calculations and aggregations
+   Handles: Sums, averages, counts, capital ratios, grouping
+   Supports: tier1_ratio calculation, custom aggregations, multi-level grouping
+
+3. **get_ffiec_schema_info** - Schema discovery
+   Handles: Available banks, dates, report elements, schedules, table overview
+
+TOOL SELECTION STRATEGY:
+
+Query Type → Tool Selection:
+
+- "Total assets for Bank X" → query_ffiec_data(bank_identifier="X", report_elements=["TOTAL ASSETS"])
+- "Capital structure" → query_ffiec_data(bank_identifier="X", source_item_pattern="%stock%|%surplus%|%earnings%")
+- "Verify Tier 1 ratio" → calculate_and_aggregate(calculation_type="tier1_ratio")
+- "Sum by category" → calculate_and_aggregate(calculation_type="sum", group_by=["Report Element"])
+- "Schedule RC items" → query_ffiec_data(schedules=["RC"])
+- "Compare RC and RC-R" → query_ffiec_data(schedules=["RC", "RC-R"])
+- "What banks exist?" → get_ffiec_schema_info(info_type="banks")
+
+KEY FILTERING PARAMETERS:
+
+**query_ffiec_data filters:**
+- bank_identifier: "Metro Financial Corporation" or "BANK001"
+- identifier_type: "name" or "id"
+- reporting_date: "2024-12-31"
+- report_elements: ["TOTAL ASSETS"] or ["TOTAL ASSETS", "CAPITAL"]
+- schedules: ["RC"] or ["RC", "RC-R"]
+- source_item_pattern: "%Cash%" or "%stock%|%surplus%" (use | for OR)
+- columns: ["Bank Name", "Value"] (None for all)
+
+**calculate_and_aggregate types:**
+- "sum": Sum values
+- "avg": Average values
+- "count": Count records
+- "tier1_ratio": Calculate Tier 1 capital ratio (auto-verifies formula)
+
+EXAMPLES:
+
+1. Total assets: query_ffiec_data(bank_identifier="Metro Financial Corporation", reporting_date="2024-12-31", report_elements=["TOTAL ASSETS"])
+
+2. Capital structure: query_ffiec_data(bank_identifier="BANK001", identifier_type="id", reporting_date="2024-12-31", source_item_pattern="%Common stock%|%Surplus%|%Retained earnings%")
+
+3. Verify ratio: calculate_and_aggregate(bank_identifier="BANK001", identifier_type="id", reporting_date="2024-12-31", calculation_type="tier1_ratio")
+
+4. Compare schedules: query_ffiec_data(bank_identifier="BANK004", identifier_type="id", reporting_date="2024-12-31", schedules=["RC", "RC-R"])
+
+5. Loan items: query_ffiec_data(bank_identifier="Metro Financial Corporation", source_item_pattern="%loan%")
+
+Remember: These tools are powerful and flexible - use appropriate filters to narrow results!
 
 YOUR RESPONSIBILITY:
-You must ANALYZE the user's natural language query and EXTRACT the structured parameters needed.
+Analyze the user's query and select the MOST APPROPRIATE tool(s). Extract structured parameters from natural language.
 
-For the FFIEC table, understand:
-- "Bank ID": Unique identifier (e.g., BANK001)
-- "Bank Name": Institution name (e.g., Metro Financial Corporation)
-- "Report Element": Category (TOTAL ASSETS, GENERAL LOAN AND LEASE VALUATION ALLOWANCES)
-- "Source Item": Detailed line items (Cash and balances, Securities, Loans, etc.)
-- "Value": Numeric amounts in dollars
-- "Reporting Date": Date in YYYY-MM-DD format
+KEY CONCEPTS:
+- **Schedule RC**: Balance Sheet items (assets, liabilities, equity)
+- **Schedule RC-R**: Risk-Based Capital (risk-weighted assets, capital ratios)
+- **Schedule RC-G**: Off-balance sheet items
+- **Report Element**: High-level category (TOTAL ASSETS, CAPITAL, etc.)
+- **Source Item**: Detailed line item within a report element
+- **FFIEC 101**: Required for banks with $10B+ in total assets
 
-HOW TO CONSTRUCT TOOL PARAMETERS:
+PARAMETER EXTRACTION GUIDELINES:
 
-1. **Extract Filters (where_conditions):**
-   - User says: "Metro Financial" → [{{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}}]
-   - User says: "banks with assets over 10 billion" → [{{"column": "Value", "operator": ">", "value": 10000000000}}]
-   - User says: "in 2024" → [{{"column": "Reporting Date", "operator": "LIKE", "value": "2024%"}}]
-   - User says: "on December 31, 2024" → [{{"column": "Reporting Date", "operator": "=", "value": "2024-12-31"}}]
+1. **Bank Identification:**
+   - "Metro Financial" → "Metro Financial Corporation"
+   - "BANK001" → "BANK001"
+   - Always use exact Bank Name or Bank ID
 
-2. **Determine Columns (select_columns):**
-   - User wants: "bank names and values" → ["Bank Name", "Value"]
-   - User wants: "show me the data" → ["*"] or None
-   - User wants: "cash balances" → ["Bank Name", "Source Item", "Value"]
+2. **Date Handling:**
+   - "December 31, 2024" → "2024-12-31"
+   - "Q4 2024" / "year-end 2024" → "2024-12-31"
+   - "as of 31-12-2024" → "2024-12-31"
 
-3. **Identify Aggregations:**
-   - User says: "total", "sum" → [{{"function": "SUM", "column": "Value", "alias": "Total"}}]
-   - User says: "average" → [{{"function": "AVG", "column": "Value", "alias": "Average"}}]
-   - User says: "count" → [{{"function": "COUNT", "column": "*", "alias": "Count"}}]
+3. **Value Extraction:**
+   - User says "over 10 billion" → {{"operator": ">", "value": 10000000000}}
+   - User says "at least 1 million" → {{"operator": ">=", "value": 1000000}}
 
-4. **Detect Grouping (group_by_columns):**
-   - User says: "by bank", "for each bank" → ["Bank Name"]
-   - User says: "by category", "per element" → ["Report Element"]
-   - User says: "by date" → ["Reporting Date"]
+EXAMPLE TOOL SELECTION:
 
-5. **Extract Sorting (order_by):**
-   - User says: "highest", "largest", "top" → [{{"column": "Value", "direction": "DESC"}}]
-   - User says: "lowest", "smallest" → [{{"column": "Value", "direction": "ASC"}}]
+Query: "What is the total asset value for Metro Financial as of Dec 31, 2024?"
+Tool: get_bank_total_assets
+Parameters: {{"bank_name": "Metro Financial Corporation", "reporting_date": "2024-12-31"}}
 
-EXAMPLE TRANSLATIONS:
+Query: "Summarize the capital structure for BANK001"
+Tool: get_capital_structure
+Parameters: {{"bank_id": "BANK001", "reporting_date": "2024-12-31"}}
 
-User Query: "Show me Metro Financial's total assets on Dec 31, 2024"
-Your Tool Call:
-```python
-query_ffiec(
-    select_columns=["Bank Name", "Report Element", "Source Item", "Value"],
-    where_conditions=[
-        {{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}},
-        {{"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}},
-        {{"column": "Reporting Date", "operator": "=", "value": "2024-12-31"}}
-    ]
-)
-```
+Query: "Verify Tier 1 capital ratio for BANK001"
+Tool: calculate_capital_ratio
+Parameters: {{"bank_id": "BANK001", "reporting_date": "2024-12-31", "ratio_type": "Tier 1"}}
 
-User Query: "What's the sum of all values for Metro Financial grouped by report element?"
-Your Tool Call:
-```python
-query_ffiec(
-    select_columns=["Report Element"],
-    where_conditions=[
-        {{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}}
-    ],
-    group_by_columns=["Report Element"],
-    aggregations=[
-        {{"function": "SUM", "column": "Value", "alias": "Total Value"}}
-    ]
-)
-```
+Query: "How does Schedule RC relate to Schedule RC-R for BANK004?"
+Tool: compare_schedules
+Parameters: {{"bank_id": "BANK004", "schedules": ["RC", "RC-R"], "reporting_date": "2024-12-31"}}
 
-User Query: "Top 5 largest asset items for Metro Financial"
-Your Tool Call:
-```python
-query_ffiec(
-    select_columns=["Source Item", "Value"],
-    where_conditions=[
-        {{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}},
-        {{"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}}
-    ],
-    order_by=[{{"column": "Value", "direction": "DESC"}}],
-    limit=5
-)
-```
+Query: "Show all loan-related items for Metro Financial"
+Tool: query_by_report_element
+Parameters: {{"bank_name": "Metro Financial Corporation", "report_element_pattern": "%LOAN%"}}
 
-User Query: "Show cash-related items for Metro Financial"
-Your Tool Call:
-```python
-query_ffiec(
-    select_columns=["Source Item", "Value", "Reporting Date"],
-    where_conditions=[
-        {{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}},
-        {{"column": "Source Item", "operator": "LIKE", "value": "%cash%"}}
-    ]
-)
-```
+MULTI-TOOL QUERIES:
+For complex queries, you may need multiple tool calls:
+1. Call first tool to get base data
+2. Call second tool for related data
+3. Synthesize and compare results
 
-MULTI-TABLE QUERIES:
-If the user's query requires data from multiple tables (based on the tables parameter):
-1. Call the first table's tool with appropriate parameters
-2. Call the second table's tool with appropriate parameters
-3. COLLATE and SYNTHESIZE the results from both calls
-4. Provide a unified answer that combines insights from both tables
+IMPORTANT:
+- Extract exact values from user queries
+- Use appropriate tool for the scenario
+- For capital ratio verification, use calculate_capital_ratio
+- For schedule relationships, use compare_schedules
+- Always specify reporting date when mentioned
+- Convert natural language dates to YYYY-MM-DD format
 
-Example:
-User: "Compare FFIEC data with customer data"
-You should:
-1. Call query_ffiec(...) for relevant FFIEC data
-2. Call query_customers(...) for relevant customer data (when available)
-3. Analyze both results together
-4. Provide comparative insights
-
-IMPORTANT GUIDELINES:
-- ALWAYS extract specific values from user queries (bank names, dates, amounts)
-- Use EXACT column names from the schema
-- For bank names, use full official names (e.g., "Metro Financial Corporation")
-- For dates, convert natural language ("Dec 31, 2024") to SQL format ("2024-12-31")
-- For partial matches (like "contains cash"), use LIKE operator with % wildcards
-- When unsure about exact values, you can first query to see what's available
-- For multi-step analysis, make multiple tool calls and synthesize results
-
-CLARIFICATION PROTOCOL:
-If the query is unclear:
-- Ask what specific data they need
-- Ask for timeframes if dates are ambiguous
-- Ask which bank if not specified
-- Provide examples of available data
-
-DO NOT:
-- Pass vague text directly to tools
-- Make wild guesses about column values
-- Skip necessary filters
-- Assume column names
-
-Remember: You are the intelligent layer that translates natural language into structured database queries!
-
-
-TOOL PARAMETERS (all you need to construct any query):
-
-1. **operation**: "SELECT" (query data) or "DESCRIBE" (get table schema)
-
-2. **tables**: Which table(s) to query
-   - Single: "ffiec"
-   - Multiple with aliases: [{{"name": "customers", "alias": "c"}}, {{"name": "orders", "alias": "o"}}]
-
-3. **columns**: What to select (optional, defaults to all columns)
-   - ["Bank Name", "Value"]
-   - ["c.Customer Name", "o.Total"]
-   - [{{"column": "Value", "alias": "TotalValue"}}]
-
-4. **filters**: WHERE conditions (optional)
-   - [{{"column": "Bank Name", "operator": "=", "value": "Metro Financial"}}]
-   - [{{"column": "Value", "operator": ">", "value": 1000000}}]
-   - [{{"column": "Status", "operator": "IN", "value": ["Active", "Pending"]}}]
-   - Operators: =, !=, >, <, >=, <=, LIKE, IN, BETWEEN, IS NULL, IS NOT NULL
-
-5. **joins**: Join multiple tables (optional)
-   - [{{"type": "INNER", "table": {{"name": "orders", "alias": "o"}}, "on": "c.Customer ID = o.Customer ID"}}]
-
-6. **aggregations**: SUM, AVG, COUNT, MIN, MAX (optional)
-   - [{{"function": "SUM", "column": "Value", "alias": "Total"}}]
-   - [{{"function": "COUNT", "column": "*", "alias": "Count"}}]
-
-7. **group_by**: Group results (optional)
-   - ["Bank Name", "Reporting Date"]
-
-8. **order_by**: Sort results (optional)
-   - [{{"column": "Value", "direction": "DESC"}}]
-
-9. **having**: Filter grouped results (optional, same format as filters)
-
-10. **limit**: Max rows (optional, default: 100)
-
-HOW TO USE THE TOOL:
-
-For ANY user query, you need to:
-1. **Understand** what the user wants
-2. **Identify** which tables, columns, and filters are needed
-3. **Construct** the appropriate tool parameters
-4. **Call** execute_sql_query with those parameters
-
-EXAMPLE SCENARIOS:
-
-Simple Query:
-User: "Show me banks with total assets"
-You call: execute_sql_query(
-    operation="SELECT",
-    tables="ffiec",
-    columns=["Bank Name", "Value"],
-    filters=[{{"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}}]
-)
-
-Aggregation:
-User: "Sum all values by bank name"
-You call: execute_sql_query(
-    operation="SELECT",
-    tables="ffiec",
-    group_by=["Bank Name"],
-    aggregations=[{{"function": "SUM", "column": "Value", "alias": "Total"}}]
-)
-
-Multi-table Join:
-User: "Show customers with their orders"
-You call: execute_sql_query(
-    operation="SELECT",
-    tables=[{{"name": "customers", "alias": "c"}}],
-    columns=["c.Customer Name", "o.Order Date", "o.Total"],
-    joins=[{{"type": "INNER", "table": {{"name": "orders", "alias": "o"}}, "on": "c.Customer ID = o.Customer ID"}}]
-)
-
-Complex Query with Multiple Conditions:
-User: "Find banks with assets over 10 billion, group by bank, show total and average"
-You call: execute_sql_query(
-    operation="SELECT",
-    tables="ffiec",
-    columns=["Bank Name"],
-    filters=[{{"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}}],
-    group_by=["Bank Name"],
-    aggregations=[
-        {{"function": "SUM", "column": "Value", "alias": "Total Assets"}},
-        {{"function": "AVG", "column": "Value", "alias": "Average Assets"}}
-    ],
-    having=[{{"column": "SUM(Value)", "operator": ">", "value": 10000000000}}]
-)
-
-Get Table Schema (when unsure about structure):
-You call: execute_sql_query(
-    operation="DESCRIBE",
-    tables="ffiec"
-)
-
-MULTI-STEP QUERIES:
-
-For complex queries requiring multiple steps:
-1. First call may get intermediate data
-2. Analyze results
-3. Make second call based on first results
-4. Synthesize final answer
-
-Example:
-User: "Compare banks with 'Metro' in name vs others"
-Step 1: Get Metro banks data
-Step 2: Get non-Metro banks data  
-Step 3: Compare and present
-
-IMPORTANT GUIDELINES:
-
-1. **Extract filters from user query**: Look for specific values, comparisons, date ranges, etc.
-2. **Determine columns needed**: Only select columns relevant to the query
-3. **Identify aggregations**: Look for keywords like "total", "average", "count", "sum"
-4. **Handle dates**: Extract date filters from queries like "in 2024" or "on 2024-12-31"
-5. **Use LIKE for partial matches**: When user says "banks with Metro" use LIKE operator
-6. **Choose appropriate operators**: 
-   - Use "=" for exact matches
-   - Use ">" "<" for comparisons
-   - Use "IN" for multiple values
-   - Use "LIKE" for partial text matching
-7. **Group intelligently**: If user asks for "by bank" or "per category", use group_by
-8. **Sort results**: If user wants "top", "highest", "lowest", use order_by
-
-CLARIFICATION PROTOCOL:
-
-If the query is unclear:
-- Ask specific questions about what data is needed
-- Use DESCRIBE operation to show available columns
-- Provide examples of what you can do
-
-DO NOT:
-- Make assumptions about column values
-- Skip necessary filters
-- Use hardcoded values unless explicitly stated by user
-
-Remember: You have ONE powerful tool that can do EVERYTHING. Focus on translating the user's intent into the correct parameter combination!"""
+Remember: Choose the most specific tool that matches the user's intent!"""
 
 
 CLARIFICATION_PROMPT = """You are analyzing whether a user query has sufficient information to query the database.
@@ -344,16 +232,10 @@ CLARIFICATION_PROMPT = """You are analyzing whether a user query has sufficient 
 Available tables: {available_tables}
 
 Evaluate the user's query and determine if it's:
-1. COMPLETE - Has all necessary information to execute queries
-2. INCOMPLETE - Missing critical information (table identification, filters, etc.)
+1. COMPLETE - Has all necessary information
+2. INCOMPLETE - Missing critical information
 3. EXPLORATORY - User wants to discover what's available
 4. CLARIFICATION - User is providing additional information
-
-Consider:
-- Does the query specify which table(s) to use from available tables?
-- Does it specify what data/metrics are needed?
-- For filtered queries, are necessary identifiers provided?
-- Is this a follow-up providing clarification?
 
 Respond with a JSON object (no markdown, just the JSON):
 {{
@@ -396,23 +278,25 @@ class SQLAgentGraph:
         self.table_schemas = table_schemas
         self.graph = None
         
-        logger.info(f"Initialized SQLAgentGraph with {len(tools)} generic tools")
+        logger.info(f"Initialized SQLAgentGraph with {len(tools)} tools")
     
     def should_continue(self, state: AgentState) -> Literal["tools", "clarify", END]:
         """Determine next step based on current state"""
         messages = state["messages"]
         last_message = messages[-1]
-        
+
         if state.get("awaiting_clarification", False) and isinstance(last_message, AIMessage):
             logger.debug("Awaiting clarification - ending workflow")
             return END
-        
+
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             logger.debug(f"Tool calls detected: {len(last_message.tool_calls)}")
             return "tools"
-        
+
         if isinstance(last_message, AIMessage):
-            content = last_message.content.lower()
+            # Normalize content to handle different LLM formats
+            content = normalize_content(last_message.content).lower()
+
             clarification_indicators = [
                 "need more information",
                 "need clarification",
@@ -421,11 +305,11 @@ class SQLAgentGraph:
                 "can you specify",
                 "please provide"
             ]
-            
+
             if any(indicator in content for indicator in clarification_indicators):
                 logger.debug("Clarification needed")
                 return "clarify"
-        
+
         logger.debug("Workflow complete")
         return END
     
@@ -521,6 +405,84 @@ They are now providing clarification. Combine both pieces of information to answ
         logger.debug(f"LLM response received")
         
         return {"messages": [response]}
+    
+    def format_tool_response(self, state: AgentState) -> AgentState:
+        """Format tool responses into human-readable text"""
+        messages = state["messages"]
+        
+        # Find the last tool message and AI response
+        tool_messages = []
+        user_question = None
+        
+        for msg in reversed(messages):
+            if hasattr(msg, "type") and msg.type == "tool":
+                tool_messages.insert(0, msg)
+            elif isinstance(msg, HumanMessage):
+                user_question = msg.content
+                break
+        
+        if not tool_messages:
+            logger.debug("No tool messages to format")
+            return state
+        
+        # Get the last AI message
+        last_ai_msg = None
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                last_ai_msg = msg
+                break
+        
+        # If the AI message already has string content, skip formatting
+        if last_ai_msg and isinstance(last_ai_msg.content, str) and last_ai_msg.content.strip():
+            logger.debug("AI response already formatted as string")
+            return state
+        
+        # Extract tool results
+        tool_results = []
+        for tool_msg in tool_messages:
+            tool_results.append({
+                "tool_name": tool_msg.name if hasattr(tool_msg, "name") else "unknown",
+                "result": tool_msg.content
+            })
+        
+        # Create formatting prompt
+        formatting_prompt = f"""You are a helpful assistant that formats database query results into clear, readable responses.
+
+User's Question: {user_question}
+
+Tool Results:
+{json.dumps(tool_results, indent=2, default=str)}
+
+Your task:
+1. Analyze the tool results
+2. Create a clear, concise, human-readable response that answers the user's question
+3. Format numbers appropriately (e.g., "$2.52 billion" instead of "2520000000")
+4. Organize information logically
+5. If multiple items, present them in a clear structure (bullet points, tables, etc.)
+6. Highlight key findings
+
+Provide a natural language response that directly answers the user's question based on the tool results."""
+
+        try:
+            llm = self.llm_wrapper.get_llm()
+            formatted_response = llm.invoke([HumanMessage(content=formatting_prompt)])
+
+            # Normalize formatted response content
+            formatted_text = normalize_content(formatted_response.content)
+
+            logger.info(f"Formatted response: {len(formatted_text)} chars")
+
+            # Replace the last AI message with formatted response
+            for i in range(len(messages) - 1, -1, -1):
+                if isinstance(messages[i], AIMessage):
+                    messages[i] = AIMessage(content=formatted_text)
+                    break
+
+            return {"messages": messages}
+
+        except Exception as e:
+            logger.error(f"Error formatting response: {e}", exc_info=True)
+            return state
     
     def request_clarification(self, state: AgentState) -> AgentState:
         """Handle clarification request"""

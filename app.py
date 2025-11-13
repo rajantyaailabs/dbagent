@@ -23,15 +23,14 @@ from workflow import SQLAgentGraph
 setup_logging(AppConfig.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Initialization
-# ============================================================================
 
+# Initialization
 logger.info("Initializing SQL Agent API...")
 
 # Initialize database
 engine = create_engine(AppConfig.DATABASE_URL)
 logger.info("Database engine created")
+
 
 tools = create_database_tools(engine)
 logger.info(f"Created {len(tools)} table-specific tools")
@@ -48,10 +47,7 @@ logger.info("Session storage initialized")
 agent_cache: Dict[str, SQLAgentGraph] = {}
 
 
-# ============================================================================
 # FastAPI Application
-# ============================================================================
-
 app = FastAPI(
     title="LangGraph SQL Agent API",
     description="Intelligent multi-table SQL agent with dynamic table selection",
@@ -69,16 +65,13 @@ app.add_middleware(
 logger.info("FastAPI application initialized")
 
 
-# ============================================================================
 # Request/Response Models
-# ============================================================================
-
-
 class InvokeRequest(BaseModel):
     message: str
     tables: Optional[List[str]] = None  # NEW: List of tables to query
     session_id: Optional[str] = None
-    model: Optional[str] = "Gemini 1.5 Flash"
+    model_provider: Optional[str] = "google"
+    model_name: Optional[str] = "gemini-2.5-flash"
     temperature: Optional[float] = 0.0
     config: Dict[str, Any] = {}
 
@@ -114,18 +107,14 @@ class TableListResponse(BaseModel):
     count: int
 
 
-# ============================================================================
 # Helper Functions
-# ============================================================================
-
-
-def get_or_create_agent(model: str, temperature: float = 0.0) -> SQLAgentGraph:
+def get_or_create_agent(model_provider: str, model_name: str, temperature: float = 0.0) -> SQLAgentGraph:
     """Get or create agent with specified model (with caching)"""
-    cache_key = f"{model}_{temperature}"
+    cache_key = f"{model_name}_{temperature}"
 
     if cache_key not in agent_cache:
-        logger.info(f"Creating new agent for model: {model}")
-        llm_wrapper = LLMWrapper(model_name=model, temperature=temperature)
+        logger.info(f"Creating new agent for model: {model_name}")
+        llm_wrapper = LLMWrapper(model_provider=model_provider, model_name=model_name, temperature=temperature)
         agent_graph = SQLAgentGraph(llm_wrapper, tools, all_table_schemas)
         agent_graph.build()
         agent_cache[cache_key] = agent_graph
@@ -148,6 +137,50 @@ def get_or_create_session(session_id: str) -> Dict[str, Any]:
         }
         logger.debug(f"Created session: {session_id}")
     return conversation_sessions[session_id]
+
+
+def normalize_message_content(content: Any) -> str:
+    """
+    Normalize message content from different LLM formats to a plain string.
+
+    Different LLMs return content in different formats:
+    - OpenAI: Returns plain string
+    - Gemini: Returns list of content blocks [{'type': 'text', 'text': '...'}]
+    - Anthropic: Can return either format
+
+    Args:
+        content: Content from LLM message (string, list, or other)
+
+    Returns:
+        Normalized string content
+    """
+    if isinstance(content, str):
+        # Already a string - return as is
+        return content
+
+    if isinstance(content, list):
+        # Handle list of content blocks (common with Gemini)
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                # Extract text from structured blocks
+                if "text" in block:
+                    text_parts.append(str(block["text"]))
+                elif "content" in block:
+                    text_parts.append(str(block["content"]))
+                else:
+                    # Fallback: stringify the entire block
+                    text_parts.append(str(block))
+            elif isinstance(block, str):
+                text_parts.append(block)
+            else:
+                # Fallback for any other type
+                text_parts.append(str(block))
+
+        return " ".join(text_parts).strip()
+
+    # Fallback for any other type
+    return str(content)
 
 
 def extract_tables_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[str]:
@@ -173,12 +206,8 @@ def extract_tables_from_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[str
     return list(tables)
 
 
-# ============================================================================
 # API Endpoints
-# ============================================================================
-
-
-@app.post("/invoke", response_model=InvokeResponse)
+@app.post("/unified", response_model=InvokeResponse)
 async def invoke_agent(request: InvokeRequest):
     """
     Invoke the agent with a user message
@@ -191,15 +220,15 @@ async def invoke_agent(request: InvokeRequest):
     """
     try:
         logger.info(f"Request: {request.message[:100]}...")
-        logger.info(f"Tables: {request.tables}, Model: {request.model}")
+        logger.info(f"Tables: {request.tables}, Model: {request.model_name}")
 
         # Validate model
-        if request.model and not validate_model(request.model):
-            logger.warning(f"Invalid model: {request.model}")
+        if request.model_name and not validate_model(request.model_name):
+            logger.warning(f"Invalid model: {request.model_name}")
             return InvokeResponse(
-                response=f"Invalid model: {request.model}. Use /models endpoint.",
+                response=f"Invalid model: {request.model_name}. Use /models endpoint.",
                 success=False,
-                model_used=request.model or "Unknown",
+                model_used=request.model_name or "Unknown",
             )
 
         # Determine available tables
@@ -218,7 +247,7 @@ async def invoke_agent(request: InvokeRequest):
             return InvokeResponse(
                 response=f"Invalid tables: {invalid_tables}. Available tables: {list(all_table_schemas.keys())}",
                 success=False,
-                model_used=request.model or AppConfig.DEFAULT_MODEL,
+                model_used=request.model_name or AppConfig.DEFAULT_MODEL,
             )
 
         # Session management
@@ -233,7 +262,9 @@ async def invoke_agent(request: InvokeRequest):
         logger.debug(f"Messages in session: {len(session_state['messages'])}")
 
         # Create/get agent
-        agent = get_or_create_agent(model=request.model or AppConfig.DEFAULT_MODEL, temperature=request.temperature)
+        agent = get_or_create_agent(model_provider=request.model_provider,
+                                    model_name=request.model_name or AppConfig.DEFAULT_MODEL,
+                                    temperature=request.temperature)
 
         # Invoke agent with available tables
         logger.info("Invoking agent...")
@@ -273,7 +304,11 @@ async def invoke_agent(request: InvokeRequest):
 
         logger.info(f"Tool calls: {len(tool_calls)}, Tables queried: {tables_queried}")
 
-        response_text = last_message.content if hasattr(last_message, "content") else str(last_message)
+        # Normalize response content to handle different LLM formats
+        raw_content = last_message.content if hasattr(last_message, "content") else str(last_message)
+        response_text = normalize_message_content(raw_content)
+
+        logger.debug(f"Response normalized: {len(response_text)} chars")
 
         return InvokeResponse(
             response=response_text,

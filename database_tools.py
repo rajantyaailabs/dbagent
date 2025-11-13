@@ -1,6 +1,10 @@
+"""
+Database Tools - Consolidated tools for FFIEC table with flexible filtering
+"""
+
 import json
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 from sqlalchemy import create_engine, text
@@ -9,225 +13,289 @@ from sqlalchemy.engine import Engine
 logger = logging.getLogger(__name__)
 
 
-class FFIECDatabaseTool:
-    """
-    Table-specific tool for FFIEC banking data
-
-    FFIEC Table Schema:
-    - Bank ID: Unique bank identifier (e.g., 'BANK001')
-    - Bank Name: Financial institution name (e.g., 'Metro Financial Corporation')
-    - Report Element: Category (e.g., 'TOTAL ASSETS', 'GENERAL LOAN AND LEASE VALUATION ALLOWANCES')
-    - Item Number: Report item number
-    - Schedule: Reporting schedule code
-    - Source Item: Detailed line item description
-    - Source Item Number: Source identifier
-    - Value: Numeric value (in dollars)
-    - Reporting Date: Report date (YYYY-MM-DD)
-    """
+class FFIECTools:
+    """Consolidated tools for FFIEC banking data - fewer, more powerful tools"""
 
     def __init__(self, engine: Engine):
-        """Initialize FFIEC tool with database engine"""
+        """Initialize FFIEC tools with database engine"""
         self.engine = engine
         self.table_name = "ffiec"
-        logger.info("Initialized FFIECDatabaseTool")
+        logger.info("Initialized FFIECTools")
 
-    def create_tool(self):
-        """Create the FFIEC query tool"""
+    def create_tools(self) -> List:
+        """Create consolidated FFIEC tools"""
+        tools = []
 
+        # Tool 1: Query FFIEC Data (handles most queries)
         @tool
-        def query_ffiec(
-            select_columns: Optional[List[str]] = None,
-            where_conditions: Optional[List[Dict[str, Any]]] = None,
-            group_by_columns: Optional[List[str]] = None,
-            aggregations: Optional[List[Dict[str, str]]] = None,
-            order_by: Optional[List[Dict[str, str]]] = None,
+        def query_ffiec_data(
+            bank_identifier: Optional[str] = None,
+            identifier_type: str = "name",
+            reporting_date: Optional[str] = None,
+            report_elements: Optional[List[str]] = None,
+            schedules: Optional[List[str]] = None,
+            source_item_pattern: Optional[str] = None,
+            columns: Optional[List[str]] = None,
             limit: int = 100,
         ) -> str:
             """
-            Query the FFIEC banking data table.
+            Query FFIEC banking data with flexible filtering.
 
-            This tool queries FFIEC banking regulatory data including assets, liabilities,
-            loans, and other financial metrics reported by banks.
+            This tool handles most FFIEC queries including:
+            - Total assets by bank and date
+            - Capital structure queries
+            - Balance sheet items (Schedule RC)
+            - Risk-weighted assets (Schedule RC-R)
+            - Specific report elements or patterns
+            - Cross-schedule comparisons
 
-            The LLM should analyze the user's natural language query and extract:
-            - Which columns to retrieve
-            - What filters to apply
-            - Any aggregations needed
-            - Grouping and sorting requirements
-
-            Available Columns:
-            - "Bank ID": Unique identifier (e.g., 'BANK001')
-            - "Bank Name": Institution name (e.g., 'Metro Financial Corporation')
-            - "Report Element": Category (e.g., 'TOTAL ASSETS')
-            - "Item Number": Report item number
-            - "Schedule": Schedule code
-            - "Source Item": Detailed line item (e.g., 'Cash and balances due from depository institutions')
-            - "Source Item Number": Source ID
-            - "Value": Numeric amount in dollars
-            - "Reporting Date": Date (YYYY-MM-DD format)
+            The LLM should extract appropriate filters from user queries.
 
             Args:
-                select_columns: List of columns to return. Examples:
-                    - ["Bank Name", "Value", "Reporting Date"]
-                    - ["Report Element", "Source Item"]
-                    - None or ["*"] for all columns
-
-                where_conditions: List of filter conditions. Each condition is a dict:
-                    {
-                        "column": "Bank Name",
-                        "operator": "=",  # =, !=, >, <, >=, <=, LIKE, IN, BETWEEN
-                        "value": "Metro Financial Corporation",
-                        "logical": "AND"  # AND, OR (default: AND)
-                    }
-                    Examples:
-                    - [{"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"}]
-                    - [{"column": "Value", "operator": ">", "value": 1000000000}]
-                    - [{"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}]
-                    - [{"column": "Reporting Date", "operator": "=", "value": "2024-12-31"}]
-                    - [{"column": "Source Item", "operator": "LIKE", "value": "%Cash%"}]
-
-                group_by_columns: Columns to group by. Examples:
-                    - ["Bank Name"]
-                    - ["Report Element", "Reporting Date"]
-
-                aggregations: Aggregate functions to apply. Each is a dict:
-                    {
-                        "function": "SUM",  # SUM, AVG, COUNT, MIN, MAX
-                        "column": "Value",
-                        "alias": "Total Value"
-                    }
-                    Examples:
-                    - [{"function": "SUM", "column": "Value", "alias": "Total"}]
-                    - [{"function": "COUNT", "column": "*", "alias": "Count"}]
-                    - [{"function": "AVG", "column": "Value", "alias": "Average"}]
-
-                order_by: Sort specification. Each is a dict:
-                    {
-                        "column": "Value",
-                        "direction": "DESC"  # ASC or DESC
-                    }
-                    Examples:
-                    - [{"column": "Value", "direction": "DESC"}]
-                    - [{"column": "Bank Name", "direction": "ASC"}]
-
-                limit: Maximum rows to return (default: 100, max: 1000)
+                bank_identifier: Bank Name (e.g., "Metro Financial Corporation") or Bank ID (e.g., "BANK001")
+                                 Leave None to query all banks
+                identifier_type: "name" or "id" (default: "name")
+                reporting_date: Date in YYYY-MM-DD format (e.g., "2024-12-31"). None for all dates
+                report_elements: List of report element categories to filter by
+                                 Examples: ["TOTAL ASSETS"], ["TOTAL ASSETS", "CAPITAL"]
+                                 Use None for all report elements
+                schedules: List of schedule codes to filter by
+                          Examples: ["RC"], ["RC", "RC-R"], ["RC-G"]
+                          None for all schedules
+                source_item_pattern: Pattern to match source items (supports SQL LIKE)
+                                    Examples: "%Cash%", "%Tier 1%", "%loan%"
+                                    None for no filtering
+                columns: Specific columns to return. None for all columns
+                        Examples: ["Bank Name", "Value"], ["Source Item", "Value", "Reporting Date"]
+                limit: Maximum rows to return (default: 100)
 
             Returns:
-                JSON string with query results:
-                {
-                    "success": true,
-                    "table": "ffiec",
-                    "count": 10,
-                    "data": [{"Bank Name": "...", "Value": ...}, ...]
-                }
+                JSON string with query results
 
-            Example Usage Scenarios:
+            Example Use Cases:
 
-            1. Simple query - "Show me Metro Financial's total assets"
-               query_ffiec(
-                   select_columns=["Bank Name", "Report Element", "Value"],
-                   where_conditions=[
-                       {"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"},
-                       {"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}
-                   ]
+            1. Total assets for a bank:
+               query_ffiec_data(
+                   bank_identifier="Metro Financial Corporation",
+                   reporting_date="2024-12-31",
+                   report_elements=["TOTAL ASSETS"]
                )
 
-            2. Aggregation - "Sum all values by bank name"
-               query_ffiec(
-                   select_columns=["Bank Name"],
-                   group_by_columns=["Bank Name"],
-                   aggregations=[{"function": "SUM", "column": "Value", "alias": "Total"}]
+            2. Capital structure:
+               query_ffiec_data(
+                   bank_identifier="BANK001",
+                   identifier_type="id",
+                   reporting_date="2024-12-31",
+                   source_item_pattern="%Common stock%|%Surplus%|%Retained earnings%"
                )
 
-            3. Filtered aggregation - "Average asset values for Metro Financial"
-               query_ffiec(
-                   select_columns=["Report Element"],
-                   where_conditions=[
-                       {"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"},
-                       {"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}
-                   ],
-                   group_by_columns=["Report Element"],
-                   aggregations=[{"function": "AVG", "column": "Value", "alias": "Average"}]
+            3. Balance sheet items (Schedule RC):
+               query_ffiec_data(
+                   bank_identifier="Metro Financial Corporation",
+                   reporting_date="2024-12-31",
+                   schedules=["RC"]
                )
 
-            4. Time series - "Show Metro Financial's cash balances over time"
-               query_ffiec(
-                   select_columns=["Reporting Date", "Value"],
-                   where_conditions=[
-                       {"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"},
-                       {"column": "Source Item", "operator": "LIKE", "value": "%Cash%"}
-                   ],
-                   order_by=[{"column": "Reporting Date", "direction": "ASC"}]
+            4. Risk-weighted assets (Schedule RC-R):
+               query_ffiec_data(
+                   bank_identifier="BANK001",
+                   identifier_type="id",
+                   reporting_date="2024-12-31",
+                   schedules=["RC-R"]
                )
 
-            5. Top N query - "Top 5 largest asset items for Metro Financial"
-               query_ffiec(
-                   select_columns=["Source Item", "Value"],
-                   where_conditions=[
-                       {"column": "Bank Name", "operator": "=", "value": "Metro Financial Corporation"},
-                       {"column": "Report Element", "operator": "=", "value": "TOTAL ASSETS"}
-                   ],
-                   order_by=[{"column": "Value", "direction": "DESC"}],
-                   limit=5
+            5. Compare schedules:
+               query_ffiec_data(
+                   bank_identifier="BANK004",
+                   identifier_type="id",
+                   reporting_date="2024-12-31",
+                   schedules=["RC", "RC-R"]
                )
+
+            6. All loan-related items:
+               query_ffiec_data(
+                   bank_identifier="Metro Financial Corporation",
+                   source_item_pattern="%loan%"
+               )
+
+            7. Banks with assets over threshold (use calculate_and_filter):
+               First query all banks' assets, then filter in LLM
             """
-            return self._execute_ffiec_query(
-                select_columns=select_columns,
-                where_conditions=where_conditions,
-                group_by_columns=group_by_columns,
-                aggregations=aggregations,
-                order_by=order_by,
-                limit=limit,
+            return self._query_ffiec_data(
+                bank_identifier,
+                identifier_type,
+                reporting_date,
+                report_elements,
+                schedules,
+                source_item_pattern,
+                columns,
+                limit,
             )
 
-        logger.info("Created query_ffiec tool")
-        return query_ffiec
+        # Tool 2: Calculate and Aggregate (handles calculations, ratios, aggregations)
+        @tool
+        def calculate_and_aggregate(
+            bank_identifier: Optional[str] = None,
+            identifier_type: str = "name",
+            reporting_date: Optional[str] = None,
+            calculation_type: str = "sum",
+            group_by: Optional[List[str]] = None,
+            report_elements: Optional[List[str]] = None,
+            schedules: Optional[List[str]] = None,
+            source_item_pattern: Optional[str] = None,
+        ) -> str:
+            """
+            Calculate aggregations, ratios, and perform calculations on FFIEC data.
 
-    def _execute_ffiec_query(
+            Use this for:
+            - Summing/averaging values
+            - Calculating capital ratios
+            - Grouping data by categories
+            - Computing totals and subtotals
+
+            Args:
+                bank_identifier: Bank Name or Bank ID (None for all banks)
+                identifier_type: "name" or "id"
+                reporting_date: Date in YYYY-MM-DD format (None for all dates)
+                calculation_type: Type of calculation
+                                 - "sum": Sum values
+                                 - "avg": Average values
+                                 - "count": Count records
+                                 - "tier1_ratio": Calculate Tier 1 capital ratio
+                                 - "total_capital_ratio": Calculate total capital ratio
+                group_by: Columns to group by
+                         Examples: ["Bank Name"], ["Report Element"], ["Schedule"]
+                report_elements: Filter by report elements
+                schedules: Filter by schedules
+                source_item_pattern: Filter by source item pattern
+
+            Returns:
+                JSON string with calculated results
+
+            Example Use Cases:
+
+            1. Sum total assets:
+               calculate_and_aggregate(
+                   bank_identifier="Metro Financial Corporation",
+                   reporting_date="2024-12-31",
+                   calculation_type="sum",
+                   report_elements=["TOTAL ASSETS"]
+               )
+
+            2. Calculate Tier 1 ratio:
+               calculate_and_aggregate(
+                   bank_identifier="BANK001",
+                   identifier_type="id",
+                   reporting_date="2024-12-31",
+                   calculation_type="tier1_ratio"
+               )
+
+            3. Sum by report element:
+               calculate_and_aggregate(
+                   bank_identifier="BANK001",
+                   identifier_type="id",
+                   reporting_date="2024-12-31",
+                   calculation_type="sum",
+                   group_by=["Report Element"]
+               )
+
+            4. Average values by schedule:
+               calculate_and_aggregate(
+                   bank_identifier="Metro Financial Corporation",
+                   calculation_type="avg",
+                   group_by=["Schedule"]
+               )
+            """
+            return self._calculate_and_aggregate(
+                bank_identifier,
+                identifier_type,
+                reporting_date,
+                calculation_type,
+                group_by,
+                report_elements,
+                schedules,
+                source_item_pattern,
+            )
+
+        # Tool 3: Get Schema Info (for discovery)
+        @tool
+        def get_ffiec_schema_info(info_type: str = "overview") -> str:
+            """
+            Get schema information about FFIEC table.
+
+            Use for discovery queries or when user wants to know what data is available.
+
+            Args:
+                info_type: Type of information to retrieve
+                          - "overview": Table overview with columns
+                          - "banks": List of available banks
+                          - "dates": Available reporting dates
+                          - "report_elements": Available report elements
+                          - "schedules": Available schedule codes
+
+            Returns:
+                JSON string with schema information
+            """
+            return self._get_schema_info(info_type)
+
+        tools.extend([query_ffiec_data, calculate_and_aggregate, get_ffiec_schema_info])
+
+        logger.info(f"Created {len(tools)} consolidated FFIEC tools")
+        return tools
+
+    # Implementation methods
+
+    def _query_ffiec_data(
         self,
-        select_columns: Optional[List[str]] = None,
-        where_conditions: Optional[List[Dict[str, Any]]] = None,
-        group_by_columns: Optional[List[str]] = None,
-        aggregations: Optional[List[Dict[str, str]]] = None,
-        order_by: Optional[List[Dict[str, str]]] = None,
-        limit: int = 100,
+        bank_identifier: Optional[str],
+        identifier_type: str,
+        reporting_date: Optional[str],
+        report_elements: Optional[List[str]],
+        schedules: Optional[List[str]],
+        source_item_pattern: Optional[str],
+        columns: Optional[List[str]],
+        limit: int,
     ) -> str:
-        """Execute FFIEC query with given parameters"""
-
+        """Implementation of query_ffiec_data"""
         try:
-            # Cap limit
-            limit = min(limit, 1000)
-
             # Build SELECT clause
-            select_clause = self._build_select_clause(select_columns, aggregations)
+            if columns:
+                select_clause = ", ".join([f'"{col}"' for col in columns])
+            else:
+                select_clause = "*"
 
-            # Build WHERE clause
-            where_clause = self._build_where_clause(where_conditions)
+            # Build query
+            query = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
 
-            # Build GROUP BY clause
-            group_by_clause = self._build_group_by_clause(group_by_columns)
+            # Add filters
+            if bank_identifier:
+                column = "Bank Name" if identifier_type == "name" else "Bank ID"
+                query += f" AND \"{column}\" = '{bank_identifier}'"
 
-            # Build ORDER BY clause
-            order_by_clause = self._build_order_by_clause(order_by)
+            if reporting_date:
+                query += f" AND \"Reporting Date\" = '{reporting_date}'"
 
-            # Construct full query
-            query = f'SELECT {select_clause} FROM "{self.table_name}"'
+            if report_elements:
+                elements_str = "', '".join(report_elements)
+                query += f" AND \"Report Element\" IN ('{elements_str}')"
 
-            if where_clause:
-                query += f" WHERE {where_clause}"
+            if schedules:
+                schedules_str = "', '".join(schedules)
+                query += f" AND \"Schedule\" IN ('{schedules_str}')"
 
-            if group_by_clause:
-                query += f" GROUP BY {group_by_clause}"
+            if source_item_pattern:
+                # Handle multiple patterns separated by |
+                if "|" in source_item_pattern:
+                    patterns = source_item_pattern.split("|")
+                    pattern_conditions = [f"\"Source Item\" LIKE '{p.strip()}'" for p in patterns]
+                    query += f' AND ({" OR ".join(pattern_conditions)})'
+                else:
+                    query += f" AND \"Source Item\" LIKE '{source_item_pattern}'"
 
-            if order_by_clause:
-                query += f" ORDER BY {order_by_clause}"
+            query += f' ORDER BY "Bank Name", "Reporting Date" DESC, "Report Element" LIMIT {limit}'
 
-            query += f" LIMIT {limit}"
+            logger.info(f"Executing query_ffiec_data: {query[:200]}...")
 
-            logger.info(f"Executing FFIEC query: {query[:200]}...")
-            logger.debug(f"Full query: {query}")
-
-            # Execute query
             with self.engine.connect() as conn:
                 result = conn.execute(text(query))
                 rows = result.fetchall()
@@ -235,145 +303,220 @@ class FFIECDatabaseTool:
 
                 data = [dict(zip(columns_result, row)) for row in rows]
 
-                logger.info(f"FFIEC query returned {len(data)} rows")
+                logger.info(f"Query returned {len(data)} rows")
 
                 return json.dumps(
-                    {"success": True, "table": self.table_name, "query": query, "count": len(data), "data": data},
+                    {"success": True, "count": len(data), "data": data, "query_preview": query[:200]}, default=str
+                )
+
+        except Exception as e:
+            logger.error(f"Error in query_ffiec_data: {e}", exc_info=True)
+            return json.dumps({"success": False, "error": str(e)})
+
+    def _calculate_and_aggregate(
+        self,
+        bank_identifier: Optional[str],
+        identifier_type: str,
+        reporting_date: Optional[str],
+        calculation_type: str,
+        group_by: Optional[List[str]],
+        report_elements: Optional[List[str]],
+        schedules: Optional[List[str]],
+        source_item_pattern: Optional[str],
+    ) -> str:
+        """Implementation of calculate_and_aggregate"""
+        try:
+            # Special handling for ratio calculations
+            if calculation_type in ["tier1_ratio", "total_capital_ratio"]:
+                return self._calculate_capital_ratio(
+                    bank_identifier, identifier_type, reporting_date, calculation_type
+                )
+
+            # Build aggregation query
+            select_parts = []
+
+            # Add grouping columns
+            if group_by:
+                select_parts.extend([f'"{col}"' for col in group_by])
+
+            # Add aggregation
+            if calculation_type == "sum":
+                select_parts.append('SUM("Value") as "Total"')
+            elif calculation_type == "avg":
+                select_parts.append('AVG("Value") as "Average"')
+            elif calculation_type == "count":
+                select_parts.append('COUNT(*) as "Count"')
+            else:
+                select_parts.append('SUM("Value") as "Total"')
+
+            select_clause = ", ".join(select_parts)
+            query = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
+
+            # Add filters
+            if bank_identifier:
+                column = "Bank Name" if identifier_type == "name" else "Bank ID"
+                query += f" AND \"{column}\" = '{bank_identifier}'"
+
+            if reporting_date:
+                query += f" AND \"Reporting Date\" = '{reporting_date}'"
+
+            if report_elements:
+                elements_str = "', '".join(report_elements)
+                query += f" AND \"Report Element\" IN ('{elements_str}')"
+
+            if schedules:
+                schedules_str = "', '".join(schedules)
+                query += f" AND \"Schedule\" IN ('{schedules_str}')"
+
+            if source_item_pattern:
+                query += f" AND \"Source Item\" LIKE '{source_item_pattern}'"
+
+            # Add GROUP BY
+            if group_by:
+                group_clause = ", ".join([f'"{col}"' for col in group_by])
+                query += f" GROUP BY {group_clause}"
+
+            query += " LIMIT 100"
+
+            logger.info(f"Executing calculate_and_aggregate: {query[:200]}...")
+
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query))
+                rows = result.fetchall()
+                columns_result = result.keys()
+
+                data = [dict(zip(columns_result, row)) for row in rows]
+
+                logger.info(f"Aggregation returned {len(data)} rows")
+
+                return json.dumps(
+                    {"success": True, "calculation_type": calculation_type, "count": len(data), "data": data},
                     default=str,
                 )
 
         except Exception as e:
-            logger.error(f"Error executing FFIEC query: {str(e)}", exc_info=True)
-            return json.dumps(
-                {
-                    "success": False,
-                    "table": self.table_name,
-                    "error": str(e),
-                    "query": query if "query" in locals() else None,
-                }
-            )
+            logger.error(f"Error in calculate_and_aggregate: {e}", exc_info=True)
+            return json.dumps({"success": False, "error": str(e)})
 
-    def _build_select_clause(
-        self, select_columns: Optional[List[str]] = None, aggregations: Optional[List[Dict[str, str]]] = None
+    def _calculate_capital_ratio(
+        self, bank_identifier: Optional[str], identifier_type: str, reporting_date: Optional[str], ratio_type: str
     ) -> str:
-        """Build SELECT clause"""
-        parts = []
+        """Calculate capital ratios"""
+        try:
+            column = "Bank Name" if identifier_type == "name" else "Bank ID"
 
-        # Add regular columns
-        if select_columns and select_columns != ["*"]:
-            for col in select_columns:
-                parts.append(f'"{col}"')
-        elif not aggregations:
-            # Default to all columns if no specific selection and no aggregations
-            parts.append("*")
-        elif select_columns:
-            # Include selected columns even with aggregations (for GROUP BY)
-            for col in select_columns:
-                if col != "*":
-                    parts.append(f'"{col}"')
+            # Get relevant data for ratio calculation
+            query = f"""
+            SELECT "Source Item", "Value"
+            FROM "{self.table_name}"
+            WHERE "{column}" = '{bank_identifier}'
+            AND "Reporting Date" = '{reporting_date}'
+            AND ("Source Item" LIKE '%Tier 1%' OR "Source Item" LIKE '%risk-weighted%'
+                 OR "Source Item" LIKE '%Capital%')
+            """
 
-        # Add aggregations
-        if aggregations:
-            for agg in aggregations:
-                func = agg.get("function", "COUNT").upper()
-                col = agg.get("column", "*")
-                alias = agg.get("alias", f"{func}_{col}")
+            logger.info(f"Calculating {ratio_type} for {bank_identifier}")
 
-                if col == "*":
-                    agg_expr = f"{func}(*)"
-                else:
-                    agg_expr = f'{func}("{col}")'
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query))
+                rows = result.fetchall()
 
-                parts.append(f'{agg_expr} AS "{alias}"')
+                # Extract values
+                tier1_capital = None
+                rwa = None
+                reported_ratio = None
 
-        return ", ".join(parts) if parts else "*"
+                for row in rows:
+                    source_item = row[0].lower() if row[0] else ""
+                    value = row[1]
 
-    def _build_where_clause(self, where_conditions: Optional[List[Dict[str, Any]]] = None) -> str:
-        """Build WHERE clause"""
-        if not where_conditions:
-            return ""
+                    if "tier 1 capital" in source_item and "ratio" not in source_item:
+                        tier1_capital = value
+                    elif "gross risk-weighted assets" in source_item:
+                        rwa = value
+                    elif "tier 1" in source_item and "ratio" in source_item:
+                        reported_ratio = value
 
-        conditions = []
-        for i, cond in enumerate(where_conditions):
-            column = cond.get("column")
-            operator = cond.get("operator", "=").upper()
-            value = cond.get("value")
-            logical = cond.get("logical", "AND").upper() if i > 0 else ""
+                # Calculate
+                calculated_ratio = None
+                if tier1_capital and rwa and rwa > 0:
+                    calculated_ratio = (tier1_capital / rwa) * 100
 
-            # Build condition
-            if operator in ["IS NULL", "IS NOT NULL"]:
-                condition = f'"{column}" {operator}'
-            elif operator == "IN":
-                if isinstance(value, list):
-                    values_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in value])
-                    condition = f'"{column}" IN ({values_str})'
-                else:
-                    condition = f'"{column}" IN ({value})'
-            elif operator == "BETWEEN":
-                if isinstance(value, (list, tuple)) and len(value) == 2:
-                    val1 = f"'{value[0]}'" if isinstance(value[0], str) else str(value[0])
-                    val2 = f"'{value[1]}'" if isinstance(value[1], str) else str(value[1])
-                    condition = f'"{column}" BETWEEN {val1} AND {val2}'
-                else:
-                    raise ValueError("BETWEEN requires list/tuple with 2 values")
-            elif operator == "LIKE":
-                condition = f"\"{column}\" LIKE '{value}'"
-            else:
-                if isinstance(value, str):
-                    condition = f"\"{column}\" {operator} '{value}'"
-                else:
-                    condition = f'"{column}" {operator} {value}'
+                verification = "INCOMPLETE_DATA"
+                if calculated_ratio and reported_ratio:
+                    verification = "MATCH" if abs(calculated_ratio - reported_ratio) < 0.01 else "MISMATCH"
 
-            # Add with logical connector
-            if logical and i > 0:
-                conditions.append(f" {logical} {condition}")
-            else:
-                conditions.append(condition)
+                return json.dumps(
+                    {
+                        "success": True,
+                        "bank": bank_identifier,
+                        "date": reporting_date,
+                        "ratio_type": ratio_type,
+                        "components": {"tier1_capital": tier1_capital, "risk_weighted_assets": rwa},
+                        "calculated_ratio": round(calculated_ratio, 2) if calculated_ratio else None,
+                        "reported_ratio": reported_ratio,
+                        "verification": verification,
+                        "formula": "(Tier 1 Capital / Risk-Weighted Assets) × 100",
+                    },
+                    default=str,
+                )
 
-        return "".join(conditions)
+        except Exception as e:
+            logger.error(f"Error calculating capital ratio: {e}", exc_info=True)
+            return json.dumps({"success": False, "error": str(e)})
 
-    def _build_group_by_clause(self, group_by_columns: Optional[List[str]] = None) -> str:
-        """Build GROUP BY clause"""
-        if not group_by_columns:
-            return ""
+    def _get_schema_info(self, info_type: str) -> str:
+        """Get schema information"""
+        try:
+            if info_type == "banks":
+                query = 'SELECT DISTINCT "Bank ID", "Bank Name" FROM ffiec ORDER BY "Bank Name" LIMIT 50'
+            elif info_type == "dates":
+                query = 'SELECT DISTINCT "Reporting Date" FROM ffiec ORDER BY "Reporting Date" DESC LIMIT 20'
+            elif info_type == "report_elements":
+                query = 'SELECT DISTINCT "Report Element" FROM ffiec ORDER BY "Report Element" LIMIT 50'
+            elif info_type == "schedules":
+                query = 'SELECT DISTINCT "Schedule" FROM ffiec ORDER BY "Schedule"'
+            else:  # overview
+                return json.dumps(
+                    {
+                        "success": True,
+                        "table": "ffiec",
+                        "columns": {
+                            "Bank ID": "varchar(100)",
+                            "Bank Name": "varchar(100)",
+                            "Report Element": "varchar(100)",
+                            "Item Number": "varchar(100)",
+                            "Schedule": "varchar(100)",
+                            "Source Item": "varchar(500)",
+                            "Source Item Number": "varchar(500)",
+                            "Value": "bigint",
+                            "Reporting Date": "date",
+                        },
+                        "description": "FFIEC banking regulatory data",
+                    }
+                )
 
-        return ", ".join([f'"{col}"' for col in group_by_columns])
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query))
+                rows = result.fetchall()
+                columns = result.keys()
 
-    def _build_order_by_clause(self, order_by: Optional[List[Dict[str, str]]] = None) -> str:
-        """Build ORDER BY clause"""
-        if not order_by:
-            return ""
+                data = [dict(zip(columns, row)) for row in rows]
 
-        parts = []
-        for order in order_by:
-            column = order.get("column")
-            direction = order.get("direction", "ASC").upper()
-            parts.append(f'"{column}" {direction}')
+                return json.dumps({"success": True, "info_type": info_type, "data": data}, default=str)
 
-        return ", ".join(parts)
+        except Exception as e:
+            logger.error(f"Error getting schema info: {e}", exc_info=True)
+            return json.dumps({"success": False, "error": str(e)})
 
 
-# Factory function to create all table-specific tools
 def create_database_tools(engine: Engine) -> List:
-    """
-    Create all table-specific database tools
-
-    Args:
-        engine: SQLAlchemy engine
-
-    Returns:
-        List of tool instances
-    """
+    """Create all table-specific database tools"""
     tools = []
 
-    # Create FFIEC tool
-    ffiec_tool = FFIECDatabaseTool(engine)
-    tools.append(ffiec_tool.create_tool())
+    # Create FFIEC tools (now only 3 tools)
+    ffiec_tools = FFIECTools(engine)
+    tools.extend(ffiec_tools.create_tools())
 
-    # Add more table-specific tools here as needed
-    # Example:
-    # customers_tool = CustomersDatabaseTool(engine)
-    # tools.append(customers_tool.create_tool())
-
-    logger.info(f"Created {len(tools)} table-specific database tools")
+    logger.info(f"Created {len(tools)} database tools total")
     return tools
