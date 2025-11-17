@@ -317,7 +317,7 @@ async def invoke_agent(request: InvokeRequest):
             awaiting_clarification=result.get("awaiting_clarification", False),
             original_question=result.get("original_question"),
             session_id=session_id,
-            model_used=request.model or AppConfig.DEFAULT_MODEL,
+            model_used=request.model_name or AppConfig.DEFAULT_MODEL,
             success=True,
         )
 
