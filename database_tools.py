@@ -258,46 +258,63 @@ class FFIECTools:
     ) -> str:
         """Implementation of query_ffiec_data"""
         try:
+            params = {}
+            
             # Build SELECT clause
+            # Note: Column selection is still string interpolation but controlled by allowed columns
+            # Ideally this should be validated against schema, but for now we trust the tool definition
             if columns:
-                select_clause = ", ".join([f'"{col}"' for col in columns])
+                # Basic sanitization to ensure only alphanumeric and spaces
+                safe_columns = [c for c in columns if c.replace(" ", "").isalnum()]
+                if not safe_columns:
+                    select_clause = "*"
+                else:
+                    select_clause = ", ".join([f'"{col}"' for col in safe_columns])
             else:
                 select_clause = "*"
 
             # Build query
-            query = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
+            query_str = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
 
-            # Add filters
+            # Add filters with parameters
             if bank_identifier:
                 column = "Bank Name" if identifier_type == "name" else "Bank ID"
-                query += f" AND \"{column}\" = '{bank_identifier}'"
+                query_str += f" AND \"{column}\" = :bank_identifier"
+                params["bank_identifier"] = bank_identifier
 
             if reporting_date:
-                query += f" AND \"Reporting Date\" = '{reporting_date}'"
+                query_str += " AND \"Reporting Date\" = :reporting_date"
+                params["reporting_date"] = reporting_date
 
             if report_elements:
-                elements_str = "', '".join(report_elements)
-                query += f" AND \"Report Element\" IN ('{elements_str}')"
+                query_str += " AND \"Report Element\" IN :report_elements"
+                params["report_elements"] = tuple(report_elements)
 
             if schedules:
-                schedules_str = "', '".join(schedules)
-                query += f" AND \"Schedule\" IN ('{schedules_str}')"
+                query_str += " AND \"Schedule\" IN :schedules"
+                params["schedules"] = tuple(schedules)
 
             if source_item_pattern:
                 # Handle multiple patterns separated by |
                 if "|" in source_item_pattern:
                     patterns = source_item_pattern.split("|")
-                    pattern_conditions = [f"\"Source Item\" LIKE '{p.strip()}'" for p in patterns]
-                    query += f' AND ({" OR ".join(pattern_conditions)})'
+                    pattern_conditions = []
+                    for i, p in enumerate(patterns):
+                        param_name = f"pattern_{i}"
+                        pattern_conditions.append(f"\"Source Item\" LIKE :{param_name}")
+                        params[param_name] = p.strip()
+                    query_str += f' AND ({" OR ".join(pattern_conditions)})'
                 else:
-                    query += f" AND \"Source Item\" LIKE '{source_item_pattern}'"
+                    query_str += " AND \"Source Item\" LIKE :source_item_pattern"
+                    params["source_item_pattern"] = source_item_pattern
 
-            query += f' ORDER BY "Bank Name", "Reporting Date" DESC, "Report Element" LIMIT {limit}'
+            query_str += f' ORDER BY "Bank Name", "Reporting Date" DESC, "Report Element" LIMIT :limit'
+            params["limit"] = limit
 
-            logger.info(f"Executing query_ffiec_data: {query[:200]}...")
+            logger.info(f"Executing query_ffiec_data: {query_str[:200]}...")
 
             with self.engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query_str), params)
                 rows = result.fetchall()
                 columns_result = result.keys()
 
@@ -306,7 +323,7 @@ class FFIECTools:
                 logger.info(f"Query returned {len(data)} rows")
 
                 return json.dumps(
-                    {"success": True, "count": len(data), "data": data, "query_preview": query[:200]}, default=str
+                    {"success": True, "count": len(data), "data": data, "query_preview": query_str[:200]}, default=str
                 )
 
         except Exception as e:
@@ -332,12 +349,16 @@ class FFIECTools:
                     bank_identifier, identifier_type, reporting_date, calculation_type
                 )
 
+            params = {}
+            
             # Build aggregation query
             select_parts = []
 
             # Add grouping columns
             if group_by:
-                select_parts.extend([f'"{col}"' for col in group_by])
+                # Basic sanitization
+                safe_group_by = [c for c in group_by if c.replace(" ", "").isalnum()]
+                select_parts.extend([f'"{col}"' for col in safe_group_by])
 
             # Add aggregation
             if calculation_type == "sum":
@@ -350,38 +371,43 @@ class FFIECTools:
                 select_parts.append('SUM("Value") as "Total"')
 
             select_clause = ", ".join(select_parts)
-            query = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
+            query_str = f'SELECT {select_clause} FROM "{self.table_name}" WHERE 1=1'
 
             # Add filters
             if bank_identifier:
                 column = "Bank Name" if identifier_type == "name" else "Bank ID"
-                query += f" AND \"{column}\" = '{bank_identifier}'"
+                query_str += f" AND \"{column}\" = :bank_identifier"
+                params["bank_identifier"] = bank_identifier
 
             if reporting_date:
-                query += f" AND \"Reporting Date\" = '{reporting_date}'"
+                query_str += " AND \"Reporting Date\" = :reporting_date"
+                params["reporting_date"] = reporting_date
 
             if report_elements:
-                elements_str = "', '".join(report_elements)
-                query += f" AND \"Report Element\" IN ('{elements_str}')"
+                query_str += " AND \"Report Element\" IN :report_elements"
+                params["report_elements"] = tuple(report_elements)
 
             if schedules:
-                schedules_str = "', '".join(schedules)
-                query += f" AND \"Schedule\" IN ('{schedules_str}')"
+                query_str += " AND \"Schedule\" IN :schedules"
+                params["schedules"] = tuple(schedules)
 
             if source_item_pattern:
-                query += f" AND \"Source Item\" LIKE '{source_item_pattern}'"
+                query_str += " AND \"Source Item\" LIKE :source_item_pattern"
+                params["source_item_pattern"] = source_item_pattern
 
             # Add GROUP BY
             if group_by:
-                group_clause = ", ".join([f'"{col}"' for col in group_by])
-                query += f" GROUP BY {group_clause}"
+                safe_group_by = [c for c in group_by if c.replace(" ", "").isalnum()]
+                if safe_group_by:
+                    group_clause = ", ".join([f'"{col}"' for col in safe_group_by])
+                    query_str += f" GROUP BY {group_clause}"
 
-            query += " LIMIT 100"
+            query_str += " LIMIT 100"
 
-            logger.info(f"Executing calculate_and_aggregate: {query[:200]}...")
+            logger.info(f"Executing calculate_and_aggregate: {query_str[:200]}...")
 
             with self.engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query_str), params)
                 rows = result.fetchall()
                 columns_result = result.keys()
 
@@ -404,13 +430,17 @@ class FFIECTools:
         """Calculate capital ratios"""
         try:
             column = "Bank Name" if identifier_type == "name" else "Bank ID"
+            params = {
+                "bank_identifier": bank_identifier,
+                "reporting_date": reporting_date
+            }
 
             # Get relevant data for ratio calculation
-            query = f"""
+            query_str = f"""
             SELECT "Source Item", "Value"
             FROM "{self.table_name}"
-            WHERE "{column}" = '{bank_identifier}'
-            AND "Reporting Date" = '{reporting_date}'
+            WHERE "{column}" = :bank_identifier
+            AND "Reporting Date" = :reporting_date
             AND ("Source Item" LIKE '%Tier 1%' OR "Source Item" LIKE '%risk-weighted%'
                  OR "Source Item" LIKE '%Capital%')
             """
@@ -418,7 +448,7 @@ class FFIECTools:
             logger.info(f"Calculating {ratio_type} for {bank_identifier}")
 
             with self.engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query_str), params)
                 rows = result.fetchall()
 
                 # Extract values
@@ -469,13 +499,13 @@ class FFIECTools:
         """Get schema information"""
         try:
             if info_type == "banks":
-                query = 'SELECT DISTINCT "Bank ID", "Bank Name" FROM ffiec ORDER BY "Bank Name" LIMIT 50'
+                query_str = 'SELECT DISTINCT "Bank ID", "Bank Name" FROM ffiec ORDER BY "Bank Name" LIMIT 50'
             elif info_type == "dates":
-                query = 'SELECT DISTINCT "Reporting Date" FROM ffiec ORDER BY "Reporting Date" DESC LIMIT 20'
+                query_str = 'SELECT DISTINCT "Reporting Date" FROM ffiec ORDER BY "Reporting Date" DESC LIMIT 20'
             elif info_type == "report_elements":
-                query = 'SELECT DISTINCT "Report Element" FROM ffiec ORDER BY "Report Element" LIMIT 50'
+                query_str = 'SELECT DISTINCT "Report Element" FROM ffiec ORDER BY "Report Element" LIMIT 50'
             elif info_type == "schedules":
-                query = 'SELECT DISTINCT "Schedule" FROM ffiec ORDER BY "Schedule"'
+                query_str = 'SELECT DISTINCT "Schedule" FROM ffiec ORDER BY "Schedule"'
             else:  # overview
                 return json.dumps(
                     {
@@ -497,7 +527,7 @@ class FFIECTools:
                 )
 
             with self.engine.connect() as conn:
-                result = conn.execute(text(query))
+                result = conn.execute(text(query_str))
                 rows = result.fetchall()
                 columns = result.keys()
 
